@@ -1,0 +1,458 @@
+#!/usr/bin/env bash
+# phonectl — Android control toolkit for the Hermes agent (runs inside proot).
+#
+# Root: the termux-root-su proxy (KernelSU module) listens on an abstract unix
+# socket and authenticates the Termux uid; `su` in this container is its client.
+# Extras: Termux:API app + termux-api clients, executed as the Termux uid via
+# `run-as com.termux`; unicode input uses ADBKeyboard.
+set -uo pipefail
+
+VERSION="1.0.0"
+SU=/usr/local/bin/su
+[ -x "$SU" ] || SU=/system/bin/su
+SH=/system/bin/sh
+TP=/data/data/com.termux/files/usr
+SHOTS=/root/shots
+UI_XML=/root/ui.xml
+SC=/sdcard/agent
+mkdir -p "$SHOTS" 2>/dev/null
+
+die() { echo "phonectl: $*" >&2; exit 1; }
+need_su() { [ -x "$SU" ] || die "no root su client ($SU)"; }
+# shell-quote one argument for Android's sh
+shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+as_root() {
+    if [ "${PHONECTL_DRY:-0}" = 1 ]; then echo "ROOT: $*"; return 0; fi
+    need_su; "$SU" -c "$*"
+}
+as_shell() { "$SH" -c "$*"; }
+
+# Termux:API client as the Termux uid.
+tapi() {
+    if [ "${PHONECTL_DRY:-0}" = 1 ]; then echo "TERMUX-API: $*"; return 0; fi
+    need_su
+    local c=$1; shift
+    local args="" a
+    for a in "$@"; do args="$args $(shq "$a")"; done
+    "$SU" -c "run-as com.termux env HOME=$TP/../home PREFIX=$TP PATH=$TP/bin:/system/bin $TP/bin/termux-$c$args"
+}
+
+# ── UI hierarchy ────────────────────────────────────────────────────────────
+ui_parse() {  # $1=xml $2=mode(json|find|tapid) $3=pattern
+    python3 - "$@" <<'PY'
+import sys, re, json, xml.etree.ElementTree as ET
+path, mode, pat = sys.argv[1], sys.argv[2], (sys.argv[3] if len(sys.argv) > 3 else "")
+root = ET.parse(path).getroot()
+rows = []
+for n in root.iter('node'):
+    m = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', n.get('bounds', ''))
+    if not m:
+        continue
+    x1, y1, x2, y2 = map(int, m.groups())
+    rows.append(dict(
+        index=len(rows),
+        text=n.get('text', '') or '',
+        desc=n.get('content-desc', '') or '',
+        id=n.get('resource-id', '') or '',
+        cls=n.get('class', '').split('.')[-1],
+        bounds=n.get('bounds', ''),
+        center=[(x1 + x2) // 2, (y1 + y2) // 2],
+        clickable=n.get('clickable') == 'true',
+        focused=n.get('focused') == 'true',
+        scrollable=n.get('scrollable') == 'true',
+        enabled=n.get('enabled') != 'false',
+    ))
+if mode == 'json':
+    print(json.dumps(rows, ensure_ascii=False, separators=(',', ':')))
+    raise SystemExit(0)
+if mode == 'tapid':
+    hits = [r for r in rows if pat.lower() in r['id'].lower()]
+else:
+    hits = [r for r in rows if pat.lower() in (r['text'] + ' ' + r['desc'] + ' ' + r['id']).lower()]
+for r in hits[:40]:
+    print(f"{r['index']:3d} {r['text'][:40]!r} {r['cls']} {r['bounds']} center=({r['center'][0]},{r['center'][1]}) clickable={r['clickable']} id={r['id']}")
+if hits:
+    print(f"TAP {hits[0]['center'][0]} {hits[0]['center'][1]}")
+PY
+}
+
+dump_ui() {
+    as_root "mkdir -p $SC; uiautomator dump $SC/ui.xml >/dev/null 2>&1" || die "uiautomator dump failed"
+    as_root "cat $SC/ui.xml" > "$UI_XML" 2>/dev/null || die "cannot read dump"
+    [ -s "$UI_XML" ] || die "empty UI dump"
+}
+
+resolve_center() {  # $1=index|text  -> "x y"
+    local sel="$1" out
+    if [[ "$sel" =~ ^[0-9]+$ ]]; then
+        python3 - "$UI_XML" "$sel" <<'PY'
+import sys, re, xml.etree.ElementTree as ET
+root = ET.parse(sys.argv[1]).getroot()
+idx = int(sys.argv[2])
+for i, n in enumerate(root.iter('node')):
+    if i != idx:
+        continue
+    m = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', n.get('bounds', ''))
+    if m:
+        x1, y1, x2, y2 = map(int, m.groups())
+        print((x1 + x2) // 2, (y1 + y2) // 2)
+PY
+    else
+        out=$(ui_parse "$UI_XML" find "$sel")
+        echo "$out" | grep -E '^ *[0-9]+ ' | head -10 >&2
+        echo "$out" | grep '^TAP ' | head -1 | awk '{print $2, $3}'
+    fi
+}
+
+cmd_ui() {
+    local s="${1:-dump}"; shift || true
+    case "$s" in
+        dump)
+            dump_ui
+            python3 -c "import sys,xml.etree.ElementTree as ET;r=ET.parse(sys.argv[1]).getroot();print(len(list(r.iter('node'))),'nodes ->',sys.argv[1])" "$UI_XML" ;;
+        json) dump_ui; ui_parse "$UI_XML" json ;;
+        find) dump_ui; ui_parse "$UI_XML" find "${1:-}" ;;
+        tap|tap-text|longpress)
+            local sel="${1:?index|text}"
+            dump_ui
+            local xy; xy=$(resolve_center "$sel")
+            local x="${xy%% *}" y="${xy##* }"
+            [ -n "${x:-}" ] && [ -n "${y:-}" ] || die "node not found: $sel"
+            if [ "$s" = longpress ]; then
+                as_root "input swipe $x $y $x $y 800"
+            else
+                as_root "input tap $x $y"
+            fi
+            echo "${s}: '$sel' at $x,$y" ;;
+        tap-id)
+            dump_ui
+            local out; out=$(ui_parse "$UI_XML" tapid "${1:?resource-id}")
+            echo "$out" | grep -E '^ *[0-9]+ ' | head -10 >&2
+            local x y; read -r x y < <(echo "$out" | grep '^TAP ' | head -1 | awk '{print $2, $3}')
+            [ -n "${x:-}" ] && [ -n "${y:-}" ] || die "id not found: ${1}"
+            as_root "input tap $x $y"; echo "tapped id ${1} at $x,$y" ;;
+        swipe-node)
+            local sel="${1:?index|text}" dir="${2:-up}" dist="${3:-500}"
+            dump_ui
+            local xy; xy=$(resolve_center "$sel")
+            local x="${xy%% *}" y="${xy##* }"
+            [ -n "${x:-}" ] || die "node not found: $sel"
+            case "$dir" in
+                up) as_root "input swipe $x $((y + dist / 2)) $x $((y - dist / 2)) 300" ;;
+                down) as_root "input swipe $x $((y - dist / 2)) $x $((y + dist / 2)) 300" ;;
+                left) as_root "input swipe $((x + dist / 2)) $y $((x - dist / 2)) $y 300" ;;
+                right) as_root "input swipe $((x - dist / 2)) $y $((x + dist / 2)) $y 300" ;;
+                *) die "dir up|down|left|right" ;;
+            esac ;;
+        set-text)
+            local sel="${1:?index|text}" val="${2:?value}"
+            cmd_ui tap "$sel" >/dev/null 2>&1 || true
+            sleep 0.4
+            as_root "input keycombination KEYCODE_CTRL_LEFT KEYCODE_A; input keyevent KEYCODE_DEL" 2>/dev/null || as_root "input keyevent KEYCODE_DEL"
+            sleep 0.2
+            cmd_text "$val" ;;
+        wait)
+            local pat="${1:?text}" timeout="${2:-15}" i=0
+            while [ "$i" -lt "$timeout" ]; do
+                dump_ui
+                if ui_parse "$UI_XML" find "$pat" | grep -qE '^ *[0-9]+ '; then
+                    ui_parse "$UI_XML" find "$pat" | head -5; return 0
+                fi
+                sleep 1; i=$((i + 1))
+            done
+            echo "timeout waiting for $pat"; return 1 ;;
+        scroll-to)
+            local pat="${1:?text}" max="${2:-6}" i=0
+            while [ "$i" -lt "$max" ]; do
+                dump_ui
+                if ui_parse "$UI_XML" find "$pat" | grep -qE '^ *[0-9]+ '; then
+                    ui_parse "$UI_XML" find "$pat" | head -5; return 0
+                fi
+                as_root "input swipe 540 1600 540 800 300"; sleep 0.6; i=$((i + 1))
+            done
+            echo "not found after $max scrolls"; return 1 ;;
+        focus) as_root "dumpsys window | grep -E 'mCurrentFocus|mFocusedApp'" | head -4 ;;
+        *) die "ui dump|json|find|tap|tap-text|tap-id|longpress|swipe-node|set-text|wait|scroll-to|focus" ;;
+    esac
+}
+
+# ── Text input ──────────────────────────────────────────────────────────────
+cmd_text() {
+    need_su
+    local clear=0 text=""
+    if [ "${1:-}" = "--clear" ]; then clear=1; shift; fi
+    text="$*"
+    [ -n "$text" ] || die "no text"
+    local b64; b64=$(printf '%s' "$text" | base64 -w0)
+    local unicode=0
+    case "$text" in *[!\ -~]*) unicode=1 ;; esac
+    local prev_ime=""
+    if [ "$unicode" = 1 ]; then
+        if [ "${PHONECTL_DRY:-0}" = 1 ]; then prev_ime=""; else
+            prev_ime=$(as_root "settings get secure default_input_method" | tr -d '\r')
+        fi
+        as_root "ime enable com.android.adbkeyboard/.AdbIME >/dev/null 2>&1; ime set com.android.adbkeyboard/.AdbIME" >/dev/null
+        sleep 0.4
+    fi
+    if [ "$clear" = 1 ]; then
+        if [ "$unicode" = 1 ]; then
+            as_root "am broadcast -a ADB_CLEAR_TEXT >/dev/null"
+        else
+            as_root "input keyevent KEYCODE_MOVE_END; input keycombination KEYCODE_CTRL_LEFT KEYCODE_A; input keyevent KEYCODE_DEL" 2>/dev/null \
+                || as_root "input keyevent KEYCODE_DEL"
+        fi
+        sleep 0.2
+    fi
+    if [ "$unicode" = 1 ]; then
+        as_root "am broadcast -a ADB_INPUT_B64 --es msg $(shq "$b64")" >/dev/null
+        sleep 1.0
+        if [ -n "$prev_ime" ] && [ "$prev_ime" != "null" ]; then
+            as_root "ime set $(shq "$prev_ime") >/dev/null 2>&1"
+        fi
+        echo "typed (unicode via ADBKeyboard): $text"
+    else
+        as_root "input text $(shq "${text// /%s}")"
+        echo "typed: $text"
+    fi
+}
+
+# ── Screen ──────────────────────────────────────────────────────────────────
+cmd_shot() {
+    need_su
+    local out="${1:-$SC/shot-$(date +%Y%m%d-%H%M%S).png}"
+    local dir; dir=$(dirname "$out")
+    as_root "mkdir -p $(shq "$dir"); screencap -p $(shq "$out")" || die "screencap failed"
+    local name; name=$(basename "$out")
+    cp "$out" "$SHOTS/$name" 2>/dev/null || as_root "cat $(shq "$out")" > "$SHOTS/$name"
+    echo "device: $out"; echo "local:  $SHOTS/$name"
+}
+
+cmd_record() {
+    need_su
+    local secs="${1:-10}" out="${2:-$SC/record-$(date +%Y%m%d-%H%M%S).mp4}"
+    local dir; dir=$(dirname "$out")
+    if [ "${PHONECTL_DRY:-0}" = 1 ]; then
+        echo "ROOT: mkdir -p $(shq "$dir")"
+        echo "ROOT: screenrecord --time-limit $(shq "$secs") $(shq "$out")"
+        return 0
+    fi
+    as_root "mkdir -p $(shq "$dir")"
+    local msg rc
+    msg=$(as_root "screenrecord --time-limit $(shq "$secs") $(shq "$out")" 2>&1); rc=$?
+    if [ "$rc" -ne 0 ] || ! as_root "test -s $(shq "$out")"; then
+        echo "record failed (screen must be on and unlocked): ${msg:-file is empty}" >&2
+        return 1
+    fi
+    echo "recorded: $out"
+}
+
+# ── Apps / files ────────────────────────────────────────────────────────────
+cmd_app() {
+    local sub="${1:-list}"; shift || true
+    case "$sub" in
+        list) need_su; as_root "pm list packages ${1:-}" | sed 's/^package://' | sort ;;
+        start) need_su; as_root "monkey -p $(shq "${1:?pkg}") -c android.intent.category.LAUNCHER 1" 2>&1 | tail -2 ;;
+        stop) need_su; as_root "am force-stop $(shq "${1:?pkg}")" ;;
+        info) need_su; as_root "dumpsys package $(shq "${1:?pkg}")" | head -60 ;;
+        install) need_su; as_root "pm install -r $(shq "${1:?apk}")" | tail -2 ;;
+        uninstall) need_su; as_root "pm uninstall $(shq "${1:?pkg}")" ;;
+        current) as_root "dumpsys window | grep mCurrentFocus" | head -2 ;;
+        *) die "app list|start|stop|info|install|uninstall|current" ;;
+    esac
+}
+
+cmd_pull() {
+    need_su
+    local src="${1:?src}" dst="${2:-.}"
+    as_root "cat $(shq "$src")" > "$dst" || die "pull failed"
+    echo "pulled $src -> $dst"
+}
+
+cmd_push() {
+    need_su
+    local src="${1:?src}" dst="${2:?dst}"
+    local dir; dir=$(dirname "$dst")
+    as_root "mkdir -p $(shq "$dir"); cat > $(shq "$dst")" < "$src" || die "push failed"
+    echo "pushed $src -> $dst"
+}
+
+cmd_selftest() {
+    local fails=0
+    echo "phonectl selftest v$VERSION"
+    local uid; uid=$(as_root 'id -u' 2>/dev/null | tr -d '\r')
+    if [ "$uid" = "0" ]; then echo "PASS root (uid 0)"; else echo "FAIL root (got '${uid:-none}')"; fails=$((fails + 1)); fi
+    local model; model=$(as_root 'getprop ro.product.model' 2>/dev/null | tr -d '\r')
+    if [ -n "$model" ]; then echo "PASS getprop ($model)"; else echo "FAIL getprop"; fails=$((fails + 1)); fi
+    if dump_ui 2>/dev/null && grep -q '<hierarchy' "$UI_XML"; then
+        echo "PASS ui dump ($(grep -o '<node' "$UI_XML" | wc -l) nodes)"
+    else
+        echo "FAIL ui dump"; fails=$((fails + 1))
+    fi
+    local shot; shot="$SC/selftest-$(date +%s).png"
+    if as_root "screencap -p $(shq "$shot")" >/dev/null 2>&1 && as_root "test -s $(shq "$shot")"; then
+        echo "PASS screenshot ($shot)"
+    else
+        echo "FAIL screenshot"; fails=$((fails + 1))
+    fi
+    local pct; pct=$(tapi battery-status 2>/dev/null | grep -o '"percentage": *[0-9]*' | head -1)
+    if [ -n "$pct" ]; then echo "PASS termux-api battery ($pct)"; else echo "FAIL termux-api battery"; fails=$((fails + 1)); fi
+    if [ "$fails" -eq 0 ]; then echo "ALL PASS"; return 0; fi
+    echo "$fails check(s) failed"; return 1
+}
+
+usage() {
+cat <<'EOF'
+phonectl — Android control for the agent (root via termux-root-su; Termux:API)
+
+Root / shell
+  phonectl root <cmd>             real Android root shell
+  phonectl sh <cmd>               Android shell
+  phonectl sysinfo                model / Android / SDK / serial / uptime
+  phonectl selftest               verify root, ui dump, screenshot, termux-api
+
+UI automation
+  phonectl ui dump | json         hierarchy (json: index,text,desc,id,class,bounds,center,...)
+  phonectl ui find <text>         matching nodes + first center
+  phonectl ui tap <index|text>    tap by node index or text/desc/id match
+  phonectl ui tap-text <text>     alias of tap with text
+  phonectl ui tap-id <id>         tap by resource-id
+  phonectl ui longpress <sel>     long-press node
+  phonectl ui swipe-node <sel> up|down|left|right [dist]
+  phonectl ui set-text <sel> <v>  focus, clear, type (unicode-safe)
+  phonectl ui wait <text> [s]     poll until element appears
+  phonectl ui scroll-to <text> [n]
+  phonectl ui focus               current focused window/activity
+
+Raw input
+  phonectl tap <x> <y> | doubletap <x> <y>
+  phonectl swipe <x1> <y1> <x2> <y2> [ms]
+  phonectl drag <x1> <y1> <x2> <y2> [ms]
+  phonectl longpress <x> <y> [ms]
+  phonectl scroll up|down
+  phonectl text [--clear] <text>  ASCII via input text; CJK via ADBKeyboard
+  phonectl key <KEYCODE|HOME|BACK|ENTER|POWER|MENU>
+  phonectl keycombo <k1> <k2>     input keycombination (e.g. CTRL+A)
+
+Screen / apps / files
+  phonectl screenshot [path]      PNG; copied to /root/shots/
+  phonectl record [secs] [path]   screenrecord
+  phonectl screen on|off|unlock|lock
+  phonectl app list|start|stop|info|install|uninstall|current
+  phonectl pull <device> [dest] | phonectl push <local> <device>
+  phonectl intent <action> [uri]
+
+System
+  phonectl battery | wifi status|on|off|scan | brightness [n]
+  phonectl volume up|down|mute|unmute|list
+  phonectl media play|pause|next|prev | rotation auto|0|1|2|3 | airplane on|off
+  phonectl ime adb|system|status
+
+Termux:API
+  phonectl notify <title> <text> | toast <text> | vibrate [ms] | tts <text>
+  phonectl clipboard get|set <text>
+  phonectl camera [id] [path] | sms list|send <num> <text> | call <num>
+  phonectl location [args] | sensor [list|name] | torch on|off
+  phonectl share <file> | download <url>
+  phonectl termux <client> [args...]
+
+Env: PHONECTL_DRY=1 prints the underlying commands instead of running them.
+EOF
+}
+
+main() {
+    local c="${1:-}"
+    case "$c" in
+        ""|help|-h|--help) usage ;;
+        -V|--version|version) echo "phonectl v$VERSION" ;;
+        root) shift; as_root "$*" ;;
+        sh) shift; as_shell "$*" ;;
+        sysinfo) as_root 'getprop ro.product.model; getprop ro.build.version.release; getprop ro.build.version.sdk; getprop ro.serialno; uptime' ;;
+        selftest) cmd_selftest ;;
+        ui) shift; cmd_ui "$@" ;;
+        tap) shift; need_su; as_root "input tap ${1:?x} ${2:?y}" ;;
+        doubletap) shift; need_su; as_root "input tap ${1:?x} ${2:?y}; input tap ${1:?x} ${2:?y}" ;;
+        swipe) shift; need_su; as_root "input swipe ${1:?} ${2:?} ${3:?} ${4:?} ${5:-300}" ;;
+        drag) shift; need_su; as_root "input draganddrop ${1:?} ${2:?} ${3:?} ${4:?} ${5:-500}" ;;
+        longpress) shift; need_su; as_root "input swipe ${1:?} ${2:?} ${1:?} ${2:?} ${3:-800}" ;;
+        scroll) shift; need_su; case "${1:-down}" in up) as_root "input swipe 540 800 540 1600 300" ;; *) as_root "input swipe 540 1600 540 800 300" ;; esac ;;
+        text) shift; cmd_text "$@" ;;
+        key) shift; need_su; local k="${1:?key}"
+             case "$k" in HOME) k=KEYCODE_HOME ;; BACK) k=KEYCODE_BACK ;; ENTER) k=KEYCODE_ENTER ;; MENU) k=KEYCODE_MENU ;; POWER) k=KEYCODE_POWER ;; esac
+             as_root "input keyevent $k" ;;
+        keycombo) shift; need_su; as_root "input keycombination $*" ;;
+        screenshot) shift; cmd_shot "${1:-}" ;;
+        record) shift; cmd_record "${1:-}" "${2:-}" ;;
+        screen) shift; need_su; case "${1:-on}" in
+                  on) as_root "input keyevent KEYCODE_WAKEUP" ;;
+                  off) as_root "input keyevent KEYCODE_SLEEP" ;;
+                  unlock) as_root "input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard" ;;
+                  lock) as_root "input keyevent KEYCODE_SLEEP" ;;
+                  *) die "screen on|off|unlock|lock" ;; esac ;;
+        app) shift; cmd_app "$@" ;;
+        pull) shift; cmd_pull "$@" ;;
+        push) shift; cmd_push "$@" ;;
+        intent) shift; need_su; if [ $# -ge 2 ]; then as_root "am start -a $(shq "$1") -d $(shq "$2")"; else as_root "am start -a $(shq "${1:?action}")"; fi ;;
+        battery) tapi battery-status ;;
+        wifi) shift; case "${1:-status}" in
+                status) tapi wifi-connectioninfo ;;
+                on) tapi wifi-enable true ;;
+                off) tapi wifi-enable false ;;
+                scan) tapi wifi-scaninfo ;;
+                *) die "wifi status|on|off|scan" ;; esac ;;
+        brightness) shift; if [ -n "${1:-}" ]; then tapi brightness "$1"; else as_root 'settings get system screen_brightness'; fi ;;
+        volume) shift; case "${1:-up}" in
+                  up) as_root 'input keyevent KEYCODE_VOLUME_UP' ;;
+                  down) as_root 'input keyevent KEYCODE_VOLUME_DOWN' ;;
+                  mute) tapi volume music 0 2>/dev/null || as_root 'input keyevent KEYCODE_VOLUME_MUTE' ;;
+                  unmute) as_root 'input keyevent KEYCODE_VOLUME_UP' ;;
+                  list) tapi volume ;;
+                  *) die "volume up|down|mute|unmute|list" ;; esac ;;
+        media) shift; case "${1:-play}" in
+                 play) tapi media-player play 2>/dev/null || as_root 'cmd media_session dispatch play' ;;
+                 pause) tapi media-player pause 2>/dev/null || as_root 'cmd media_session dispatch pause' ;;
+                 next) as_root 'cmd media_session dispatch next' ;;
+                 prev) as_root 'cmd media_session dispatch previous' ;;
+                 *) die "media play|pause|next|prev" ;; esac ;;
+        rotation) shift; need_su; case "${1:-auto}" in
+                    auto) as_root 'settings put system accelerometer_rotation 1' ;;
+                    *) as_root "settings put system accelerometer_rotation 0; settings put system user_rotation $(shq "$1")" ;; esac ;;
+        airplane) shift; need_su; case "${1:-off}" in
+                    on) as_root 'cmd connectivity airplane-mode enable' ;;
+                    off) as_root 'cmd connectivity airplane-mode disable' ;;
+                    *) die "airplane on|off" ;; esac ;;
+        ime) shift; need_su; case "${1:-status}" in
+                adb)
+                    local cur; cur=$(as_root 'settings get secure default_input_method' | tr -d '\r')
+                    case "$cur" in
+                        *adbkeyboard*) : ;;
+                        "") : ;;
+                        *) printf '%s\n' "$cur" > /root/.phonectl-ime ;;
+                    esac
+                    as_root 'ime enable com.android.adbkeyboard/.AdbIME; ime set com.android.adbkeyboard/.AdbIME' ;;
+                system)
+                    local prev=""
+                    [ -f /root/.phonectl-ime ] && prev=$(cat /root/.phonectl-ime)
+                    [ -n "$prev" ] || prev=$(as_root 'settings get secure default_input_method' | tr -d '\r')
+                    case "$prev" in *adbkeyboard*) die "no previous IME recorded" ;; esac
+                    as_root "ime set $(shq "$prev")" ;;
+                status) as_root 'settings get secure default_input_method' ;;
+                *) die "ime adb|system|status" ;; esac ;;
+        notify) shift; tapi notification --title "${1:-Hermes}" --content "${2:-done}" ;;
+        toast) shift; tapi toast "${1:-hello}" ;;
+        vibrate) shift; tapi vibrate -d "${1:-300}" ;;
+        tts) shift; tapi tts-speak "${1:?text}" ;;
+        clipboard) shift; case "${1:-get}" in get) tapi clipboard-get ;; set) tapi clipboard-set "${2:?text}" ;; *) die "clipboard get|set" ;; esac ;;
+        camera) shift; tapi camera-photo -c "${1:-0}" "${2:-/sdcard/DCIM/agent-$(date +%s).jpg}" ;;
+        sms) shift; case "${1:-list}" in list) tapi sms-list ;; send) tapi sms-send -n "${2:?number}" "${3:?text}" ;; *) die "sms list|send" ;; esac ;;
+        call) shift; tapi telephony-call "${1:?number}" ;;
+        location) shift; if [ $# -eq 0 ]; then tapi location -p gps; else tapi location "$@"; fi ;;
+        sensor) shift; if [ "${1:-list}" = list ]; then tapi sensor -l; else local name="${1:-accelerometer}"; tapi sensor -s "$name" -n 1; fi ;;
+        torch) shift; tapi torch "${1:-on}" ;;
+        share) shift; tapi share -f "${1:?file}" ;;
+        download) shift; tapi download "${1:?url}" ;;
+        termux) shift; local a="${1:?client}"; shift || true; tapi "$a" "$@" ;;
+        *) usage; exit 1 ;;
+    esac
+}
+main "$@"
